@@ -8,6 +8,8 @@ Launch:
 """
 
 import os
+import sys
+import subprocess
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -26,6 +28,64 @@ JOHNSON_INAUGURATION = pd.Timestamp("2023-05-15")
 
 # Data loading (cached)
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "derived-data")
+PREPROCESS_SCRIPT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "code", "preprocessing.py")
+)
+
+
+def ensure_data():
+    """Run preprocessing.py if the main cleaned CSV is missing."""
+    csv_path = os.path.join(DATA_DIR, "311_cleaned.csv")
+    if os.path.exists(csv_path):
+        return  # already done
+
+    st.markdown("## ⏳ First-Time Setup")
+    st.markdown(
+        "The cleaned dataset isn't on disk yet. "
+        "Downloading and processing Chicago 311 data from public APIs — "
+        "**this takes about 5–10 minutes and only happens once.**"
+    )
+
+    steps = [
+        "Downloading 311 Service Requests (~350 MB from Chicago Data Portal)...",
+        "Downloading ACS Census data...",
+        "Downloading Community Area Boundaries...",
+        "Cleaning and processing 311 data...",
+        "Building community area statistics...",
+        "Saving derived data files...",
+    ]
+    progress_bar = st.progress(0)
+    status = st.empty()
+
+    for i, step in enumerate(steps):
+        status.info(f"Step {i+1}/{len(steps)}: {step}")
+        progress_bar.progress((i) / len(steps))
+
+    status.info("Running preprocessing pipeline… (please wait)")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, PREPROCESS_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=2400,   # 40-minute hard limit
+        )
+    except subprocess.TimeoutExpired:
+        st.error("❌ Preprocessing timed out after 40 minutes. Please try reloading.")
+        st.stop()
+
+    if result.returncode != 0:
+        st.error("❌ Preprocessing failed. Error output:")
+        st.code(result.stderr[-3000:])
+        st.stop()
+
+    progress_bar.progress(1.0)
+    status.success("✅ Data ready! Reloading app...")
+    st.rerun()
+
+
+# Run data check before anything else
+ensure_data()
 
 
 @st.cache_data
