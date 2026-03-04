@@ -39,6 +39,21 @@ URL_ACS = "https://api.census.gov/data/2022/acs/acs5"
 
 
 # Download 311 Service Requests (paginated to bypass Socrata's default row limit)
+def _get_with_retry(url, params=None, max_attempts=6, timeout=120):
+    """GET request with exponential backoff retry on network errors."""
+    for attempt in range(max_attempts):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except Exception as exc:
+            if attempt == max_attempts - 1:
+                raise
+            wait = 2 ** attempt          # 1, 2, 4, 8, 16, 32 s
+            print(f"\n  [retry {attempt+1}/{max_attempts-1}] {exc} — waiting {wait}s...")
+            time.sleep(wait)
+
+
 def download_311(output_path):
     if os.path.exists(output_path):
         print(f"Already exists: {output_path}")
@@ -56,8 +71,7 @@ def download_311(output_path):
             "$where":  f"created_date >= '{STUDY_START}' AND created_date <= '{STUDY_END}'",
             "$order":  "created_date ASC",
         }
-        r = requests.get(URL_311_API, params=params, timeout=300)
-        r.raise_for_status()
+        r = _get_with_retry(URL_311_API, params=params, timeout=120)
 
         chunk = pd.read_csv(pd.io.common.StringIO(r.text), low_memory=False)
         if chunk.empty:
@@ -69,6 +83,8 @@ def download_311(output_path):
 
         if len(chunk) < PAGE_SIZE:
             break   # last page
+
+        time.sleep(0.25)   # be polite to the API
 
     df_all = pd.concat(all_chunks, ignore_index=True)
     df_all.to_csv(output_path, index=False)
