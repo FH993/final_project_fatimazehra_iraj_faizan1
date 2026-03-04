@@ -1,4 +1,5 @@
 pandas>=2.0
+pyarrow>=14.0
 numpy>=1.24
 plotly>=5.18
 geopandas>=0.14

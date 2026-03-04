@@ -45,7 +45,7 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "derived-data")
 # ─── Data ─────────────────────────────────────────────────────────────────
 @st.cache_data
 def load_all():
-    df = pd.read_csv(os.path.join(DATA_DIR, "311_cleaned.csv"), low_memory=False)
+    df = pd.read_parquet(os.path.join(DATA_DIR, "311_cleaned.parquet"))
     df["created_date"] = pd.to_datetime(df["created_date"], errors="coerce")
     df["closed_date"] = pd.to_datetime(df["closed_date"], errors="coerce")
     df["year_month"] = df["created_date"].dt.to_period("M").dt.to_timestamp()

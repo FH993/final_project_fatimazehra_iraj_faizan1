@@ -28,11 +28,11 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "derived-data")
 
 @st.cache_data
 def load_data():
-    csv_path = os.path.join(DATA_DIR, "311_cleaned.csv")
-    if not os.path.exists(csv_path):
+    parquet_path = os.path.join(DATA_DIR, "311_cleaned.parquet")
+    if not os.path.exists(parquet_path):
         st.error("Data not found. Run `python code/preprocessing.py` first.")
         st.stop()
-    df = pd.read_csv(csv_path, low_memory=False)
+    df = pd.read_parquet(parquet_path)
     df["created_date"] = pd.to_datetime(df["created_date"], errors="coerce")
     df["closed_date"] = pd.to_datetime(df["closed_date"], errors="coerce")
     df["year_month"] = df["created_date"].dt.to_period("M").dt.to_timestamp()
