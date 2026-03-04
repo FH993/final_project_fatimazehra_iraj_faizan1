@@ -1,394 +1,579 @@
 """
 Chicago 311 Service Delivery Dashboard
-From Request to Resolution: An interactive exploration of how Chicago
-responds to its residents' needs — and who waits the longest.
+From Request to Resolution — Altair Edition
 
 Launch:
     streamlit run streamlit-app/app.py
 """
 
-import os
+import os, json, copy
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
 
-# Config
+alt.data_transformers.disable_max_rows()
+
+# ─── Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="From Request to Resolution | Chicago 311",
-    page_icon=":cityscape:",
+    page_title="Chicago 311 Dashboard",
+    page_icon="🏙️",
     layout="wide",
 )
 
-alt.data_transformers.disable_max_rows()
+st.markdown("""<style>
+.main .block-container { max-width: 1100px; padding-top: 1.5rem; }
+#MainMenu, footer { visibility: hidden; }
+</style>""", unsafe_allow_html=True)
 
-JOHNSON_INAUGURATION = pd.Timestamp("2023-05-15")
+JOHNSON_DATE = pd.Timestamp("2023-05-15")
 
-# Data loading (cached)
+# Colors
+BLUE = "#5B8DB8"
+ORANGE = "#D97B53"
+PERIOD_LABELS = ["2021–Apr 2023", "May 2023–2024"]
+PERIOD_COLORS = {"2021–Apr 2023": BLUE, "May 2023–2024": ORANGE}
+Q_COLORS = {
+    "Q1 (Lowest)": "#c0392b", "Q2": "#e67e22", "Q3": "#f1c40f",
+    "Q4": "#27ae60", "Q5 (Highest)": "#2980b9",
+}
+Q_ORDER = ["Q1 (Lowest)", "Q2", "Q3", "Q4", "Q5 (Highest)"]
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "derived-data")
 
 
+# ─── Data ─────────────────────────────────────────────────────────────────
 @st.cache_data
-def load_data():
-    csv_path = os.path.join(DATA_DIR, "311_cleaned.csv")
-    if os.path.exists(csv_path):
-        df = pd.read_csv(csv_path, low_memory=False)
-    else:
-        st.error("Data not found. Run `python code/preprocessing.py` first.")
-        st.stop()
+def load_all():
+    df = pd.read_csv(os.path.join(DATA_DIR, "311_cleaned.csv"), low_memory=False)
     df["created_date"] = pd.to_datetime(df["created_date"], errors="coerce")
     df["closed_date"] = pd.to_datetime(df["closed_date"], errors="coerce")
     df["year_month"] = df["created_date"].dt.to_period("M").dt.to_timestamp()
     df["period"] = np.where(
-        df["created_date"] < JOHNSON_INAUGURATION, "Pre-Johnson", "Johnson Admin"
+        df["created_date"] < JOHNSON_DATE, "2021–Apr 2023", "May 2023–2024"
     )
     df["community_area"] = (
         pd.to_numeric(df["community_area"], errors="coerce")
         .astype("Int64").astype(str)
     )
-    return df
+    ca = pd.read_csv(os.path.join(DATA_DIR, "community_area_stats.csv"))
+    ca["area_numbe"] = ca["area_numbe"].astype(str)
+    geo_path = os.path.join(DATA_DIR, "community_areas.geojson")
+    geo = json.load(open(geo_path)) if os.path.exists(geo_path) else None
+    return df, ca, geo
 
 
-@st.cache_data
-def load_community_stats():
-    path = os.path.join(DATA_DIR, "community_area_stats.csv")
-    if os.path.exists(path):
-        cs = pd.read_csv(path)
-        cs["area_numbe"] = cs["area_numbe"].astype(str)
-        return cs
-    return None
+df, ca_stats, geojson = load_all()
 
 
-# Inauguration annotation helpers
-rule_df = pd.DataFrame({"date": [JOHNSON_INAUGURATION]})
+# ─── Altair helpers ───────────────────────────────────────────────────────
+def johnson_rule():
+    """Return a dashed vertical rule + label at the Johnson inauguration date."""
+    rule_df = pd.DataFrame({"date": [JOHNSON_DATE]})
+    rule = alt.Chart(rule_df).mark_rule(
+        strokeDash=[5, 4], color="#888", strokeWidth=1.5
+    ).encode(x="date:T")
+    label = alt.Chart(rule_df).mark_text(
+        align="left", dx=5, dy=-8, fontSize=10, color="#666", text="Johnson Inauguration"
+    ).encode(x="date:T")
+    return rule + label
 
 
-def inaug_rule():
-    return (
-        alt.Chart(rule_df)
-        .mark_rule(color="black", strokeDash=[4, 4], strokeWidth=2)
-        .encode(x="date:T")
-    )
-
-
-def inaug_text():
-    return (
-        alt.Chart(rule_df)
-        .mark_text(align="left", dx=5, dy=-10, fontSize=11, fontWeight="bold")
-        .encode(x="date:T", text=alt.value("Johnson Inauguration"))
-    )
-
-# Load data
-df = load_data()
-ca_stats = load_community_stats()
-
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
-st.sidebar.header("Explore the Data")
-st.sidebar.markdown(
-    "Use the controls below to focus on specific service types, "
-    "time periods, or income groups."
+PERIOD_SCALE = alt.Scale(
+    domain=PERIOD_LABELS,
+    range=[BLUE, ORANGE],
 )
 
-# Service type checkboxes — top 5
-st.sidebar.subheader("Service Types")
-top_types = df["sr_type"].value_counts().head(5).index.tolist()
-
-selected_types = []
-for stype in top_types:
-    if st.sidebar.checkbox(stype, value=True, key=f"cb_{stype}"):
-        selected_types.append(stype)
-
-st.sidebar.divider()
-
-# Date range
-st.sidebar.subheader("Time Period")
-min_date = df["created_date"].min().date()
-max_date = df["created_date"].max().date()
-date_range = st.sidebar.slider(
-    "Date Range", min_value=min_date, max_value=max_date,
-    value=(min_date, max_date), format="YYYY-MM",
+Q_SCALE = alt.Scale(
+    domain=Q_ORDER,
+    range=[Q_COLORS[q] for q in Q_ORDER],
 )
 
-st.sidebar.divider()
 
-# Income quintile
-st.sidebar.subheader("Neighborhood Income")
-quintiles = ["All"] + sorted(df["income_quintile"].dropna().unique().tolist())
-selected_quintile = st.sidebar.selectbox("Income Quintile", quintiles)
+# ─── Sidebar filters ─────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Filters")
+    min_yr, max_yr = int(df["year"].min()), int(df["year"].max())
+    yr = st.slider("Year Range", min_yr, max_yr, (min_yr, max_yr))
 
-# ---------------------------------------------------------------------------
-# Apply filters
-# ---------------------------------------------------------------------------
-if selected_types:
-    mask = (
-        df["sr_type"].isin(selected_types)
-        & (df["created_date"].dt.date >= date_range[0])
-        & (df["created_date"].dt.date <= date_range[1])
-    )
-else:
-    mask = (
-        (df["created_date"].dt.date >= date_range[0])
-        & (df["created_date"].dt.date <= date_range[1])
-    )
-if selected_quintile != "All":
-    mask &= df["income_quintile"] == selected_quintile
-filtered = df[mask].copy()
+    st.subheader("Service Types")
+    mode = st.radio("", ["Top categories", "Custom"], label_visibility="collapsed")
+    if mode == "Top categories":
+        n = st.slider("Top N", 3, 15, 8)
+        sel = df["sr_type"].value_counts().head(n).index.tolist()
+    else:
+        sel = st.multiselect("Choose", sorted(df["sr_type"].unique()),
+                             default=df["sr_type"].value_counts().head(5).index.tolist())
+
+    st.subheader("Income Group")
+    q_opts = ["All"] + sorted(df["income_quintile"].dropna().unique())
+    sel_q = st.selectbox("Quintile", q_opts)
+
+    st.subheader("Administration")
+    per = st.radio("Period", ["Both", "2021–Apr 2023 Only", "May 2023–2024 Only"])
+
+# Apply
+m = (df["year"] >= yr[0]) & (df["year"] <= yr[1])
+if sel:
+    m &= df["sr_type"].isin(sel)
+if sel_q != "All":
+    m &= df["income_quintile"] == sel_q
+if per == "2021–Apr 2023 Only":
+    m &= df["period"] == "2021–Apr 2023"
+elif per == "May 2023–2024 Only":
+    m &= df["period"] == "May 2023–2024"
+f = df[m].copy()
 
 
-# ---------------------------------------------------------------------------
-# Title & Introduction
-# ---------------------------------------------------------------------------
+# ─── Title ────────────────────────────────────────────────────────────────
 st.title("From Request to Resolution")
 st.markdown(
-    "### How does Chicago respond when its residents ask for help?"
+    "An interactive look at **328,000+ Chicago 311 service requests (2021–2024)** — "
+    "response patterns, the Johnson administration transition, and income-based equity."
 )
-st.markdown(
-    "Every year, hundreds of thousands of Chicagoans dial **311** to report "
-    "potholes, request garbage pickup, flag broken streetlights, and more. "
-    "Each request generates a timestamped record: *when* the call was made, "
-    "*what* was requested, *where* the problem is, and *when* (or if) it was "
-    "resolved."
-)
-st.markdown(
-    "This dashboard uses **326,000+ service requests from 2021--2024** to ask "
-    "a simple question: **is the city getting better or worse at serving its "
-    "residents?** We pay special attention to the transition between "
-    "administrations --- Mayor Brandon Johnson took office in May 2023 --- "
-    "and to whether lower-income neighborhoods wait longer for the same services."
-)
+st.divider()
 
-# Key metrics
-st.markdown("---")
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Requests Selected", f"{len(filtered):,}")
-med_resp = filtered["response_time_days"].median()
-col2.metric("Median Wait (days)", f"{med_resp:.1f}" if pd.notna(med_resp) else "N/A")
-col3.metric("Service Types", f"{filtered['sr_type'].nunique()}")
-n_areas = filtered["community_area"].nunique()
-col4.metric("Neighborhoods", f"{n_areas}")
-st.markdown("---")
+# KPIs
+med = f["response_time_days"].median()
+pre_m = f[f["period"] == "2021–Apr 2023"]["response_time_days"].median()
+post_m = f[f["period"] == "May 2023–2024"]["response_time_days"].median()
+delta = post_m - pre_m if pd.notna(pre_m) and pd.notna(post_m) else None
 
-# ---------------------------------------------------------------------------
-# Section 1: Demand — Volume & Composition
-# ---------------------------------------------------------------------------
-st.header("1. Demand: What Is the City Being Asked to Do?")
-st.markdown(
-    "Before examining performance, we need to understand the **scale and "
-    "composition** of demand. Which services generate the most requests? "
-    "Has the volume changed over time? A spike in hard-to-resolve categories "
-    "could slow response times even without any policy change."
-)
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Total Requests", f"{len(f):,}")
+k2.metric("Median Wait", f"{med:.1f} days" if pd.notna(med) else "—",
+           delta=f"{delta:+.1f}d" if delta is not None else None, delta_color="inverse")
+k3.metric("Completion Rate", f"{(f['status'] == 'Completed').mean() * 100:.1f}%")
+k4.metric("Service Types", f"{f['sr_type'].nunique()}")
 
-# Sorted bar chart of volume by service type (Fig 3 / sorted_bar_volume)
-type_counts = (
-    filtered.groupby("sr_type").size().reset_index(name="count")
-    .nlargest(15, "count")
-)
-if not type_counts.empty:
-    bar_chart = (
-        alt.Chart(type_counts)
-        .mark_bar(color="steelblue")
-        .encode(
-            x=alt.X("count:Q", title="Number of Requests"),
-            y=alt.Y("sr_type:N",
-                     sort=alt.EncodingSortField(field="count", order="descending"),
-                     title="Service Type"),
-            tooltip=[
-                alt.Tooltip("sr_type:N", title="Type"),
-                alt.Tooltip("count:Q", title="Count", format=","),
-            ],
-        )
-        .properties(width="container", height=400)
-    )
-    st.altair_chart(bar_chart, use_container_width=True)
-    st.caption(
-        "Service categories ranked by total volume. A small number of types "
-        "dominate the workload — improvements here have the largest citywide impact."
-    )
 
-# Request volume time series (Fig 2 / request_volume)
-total_pop = ca_stats["population"].sum() if ca_stats is not None else 1
-vol = filtered.groupby("year_month").size().reset_index(name="count")
-if not vol.empty:
-    vol["per_1k"] = vol["count"] / total_pop * 1000
-    vol_chart = (
-        alt.Chart(vol)
-        .mark_line(color="steelblue", point=True)
-        .encode(
-            x=alt.X("year_month:T", title="Month"),
-            y=alt.Y("per_1k:Q", title="Requests per 1,000 Residents"),
-            tooltip=[
-                alt.Tooltip("year_month:T", format="%Y-%m"),
-                alt.Tooltip("per_1k:Q", title="Per 1k", format=".2f"),
-                alt.Tooltip("count:Q", title="Count", format=","),
-            ],
-        ).properties(width="container", height=350)
-    )
-    st.altair_chart(vol_chart + inaug_rule() + inaug_text(), use_container_width=True)
-    st.caption(
-        "Monthly request volume normalised by population. Seasonal patterns are "
-        "evident, with summer months typically seeing higher demand."
-    )
+# ═══════════════════════════════════════════════════════════════════════════
+# TABS
+# ═══════════════════════════════════════════════════════════════════════════
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Overview", "Response Times", "Equity & Income",
+    "Geography", "Neighborhoods",
+])
 
-# ---------------------------------------------------------------------------
-# Section 2: Response Times — Time Series (Fig 1 / regime_time_series)
-# ---------------------------------------------------------------------------
-st.markdown("---")
-st.header("2. Response Times: Is the City Getting Faster or Slower?")
-st.markdown(
-    "The most direct measure of service quality is **how long residents wait** "
-    "from the moment they submit a request to the moment the city closes it. "
-    "The chart below tracks median response time month by month for each "
-    "selected service type, with the mayoral transition marked."
-)
 
-monthly = (
-    filtered.groupby(["year_month", "sr_type"])["response_time_days"]
-    .median().reset_index()
-)
-if not monthly.empty:
-    lines = (
-        alt.Chart(monthly).mark_line(point=True)
-        .encode(
-            x=alt.X("year_month:T", title="Month"),
-            y=alt.Y("response_time_days:Q", title="Median Response Time (days)"),
-            color=alt.Color("sr_type:N", title="Service Type"),
-            tooltip=[
-                alt.Tooltip("year_month:T", title="Month", format="%Y-%m"),
-                alt.Tooltip("sr_type:N", title="Type"),
-                alt.Tooltip("response_time_days:Q", title="Median (days)", format=".1f"),
-            ],
-        )
-    )
-    chart = (lines + inaug_rule() + inaug_text()).properties(
-        width="container", height=450
-    )
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 1: OVERVIEW
+# ═══════════════════════════════════════════════════════════════════════════
+with tab1:
+    # ── Monthly Request Volume ──
+    st.subheader("Monthly Request Volume (Count)")
+    vol = (f.groupby(["year_month", "period"]).size()
+           .reset_index(name="requests")
+           .sort_values("year_month"))
+
+    bars = alt.Chart(vol).mark_bar().encode(
+        x=alt.X("year_month:T", title="Month"),
+        y=alt.Y("requests:Q", title="Number of Requests"),
+        color=alt.Color("period:N", scale=PERIOD_SCALE, title="Period"),
+        tooltip=[
+            alt.Tooltip("year_month:T", title="Month", format="%b %Y"),
+            alt.Tooltip("requests:Q", title="Requests", format=","),
+            alt.Tooltip("period:N", title="Period"),
+        ],
+    ).properties(height=380)
+
+    st.altair_chart(bars + johnson_rule(), use_container_width=True)
+
+    # ── Top Service Categories ──
+    st.divider()
+    st.subheader("Top Service Categories by Request Count")
+    tc = (f.groupby("sr_type").size()
+          .reset_index(name="requests")
+          .nlargest(10, "requests"))
+    tc["service"] = tc["sr_type"].str[:40]
+
+    chart = alt.Chart(tc).mark_bar(color=BLUE).encode(
+        x=alt.X("requests:Q", title="Number of Requests"),
+        y=alt.Y("service:N", sort="-x", title=""),
+        tooltip=[
+            alt.Tooltip("sr_type:N", title="Service Type"),
+            alt.Tooltip("requests:Q", title="Requests", format=","),
+        ],
+    ).properties(height=380)
     st.altair_chart(chart, use_container_width=True)
-    st.caption(
-        "The dashed line marks Mayor Johnson's inauguration (May 2023). "
-        "Seasonal spikes and cross-category divergence are visible."
+
+    # ── Service Mix Over Time ──
+    st.divider()
+    st.subheader("Service Request Mix Over Time")
+    top6 = f["sr_type"].value_counts().head(6).index.tolist()
+    comp = (f[f["sr_type"].isin(top6)]
+            .groupby(["year_month", "sr_type"]).size()
+            .reset_index(name="requests")
+            .sort_values("year_month"))
+    if not comp.empty:
+        lines = alt.Chart(comp).mark_line(strokeWidth=2).encode(
+            x=alt.X("year_month:T", title="Month"),
+            y=alt.Y("requests:Q", title="Number of Requests"),
+            color=alt.Color("sr_type:N",
+                            scale=alt.Scale(scheme="set2"),
+                            title="Service Type"),
+            tooltip=[
+                alt.Tooltip("year_month:T", title="Month", format="%b %Y"),
+                alt.Tooltip("sr_type:N", title="Service Type"),
+                alt.Tooltip("requests:Q", title="Requests", format=","),
+            ],
+        ).properties(height=380)
+        st.altair_chart(lines + johnson_rule(), use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 2: RESPONSE TIMES
+# ═══════════════════════════════════════════════════════════════════════════
+with tab2:
+    # Period comparison
+    c1, c2 = st.columns(2)
+    c1.metric("2021–Apr 2023 — Median Wait",
+              f"{pre_m:.1f} days" if pd.notna(pre_m) else "—")
+    c2.metric("May 2023–2024 — Median Wait",
+              f"{post_m:.1f} days" if pd.notna(post_m) else "—")
+
+    # ── Single Service Response Time Drill-Down ──
+    st.divider()
+    st.subheader("Single Service Response Time Drill-Down")
+    avail = f["sr_type"].value_counts().head(15).index.tolist()
+    chosen = st.selectbox("Select a service type", avail)
+    svc = f[f["sr_type"] == chosen]
+    sm = (svc.groupby(["year_month", "period"])["response_time_days"]
+          .median().reset_index()
+          .sort_values("year_month"))
+    sm.columns = ["month", "period", "median_wait"]
+
+    drill_line = alt.Chart(sm).mark_line(strokeWidth=2.5, point=True).encode(
+        x=alt.X("month:T", title="Month"),
+        y=alt.Y("median_wait:Q", title="Median Response Time (days)"),
+        color=alt.Color("period:N", scale=PERIOD_SCALE, title="Period"),
+        tooltip=[
+            alt.Tooltip("month:T", title="Month", format="%b %Y"),
+            alt.Tooltip("median_wait:Q", title="Median Response Time (days)", format=".1f"),
+            alt.Tooltip("period:N", title="Period"),
+        ],
+    ).properties(height=380, title=f"Response Time — {chosen}")
+    st.altair_chart(drill_line + johnson_rule(), use_container_width=True)
+
+    # ── Which Services Got Faster or Slower? ──
+    st.divider()
+    st.subheader("Response Time Shift: Which Services Got Faster or Slower?")
+    st.markdown("Change in median response time (days) from 2021–Apr 2023 to May 2023–2024.")
+
+    pre_s = df[df["period"] == "2021–Apr 2023"].groupby("sr_type")["response_time_days"].median()
+    post_s = df[df["period"] == "May 2023–2024"].groupby("sr_type")["response_time_days"].median()
+    chg = (post_s - pre_s).dropna().reset_index()
+    chg.columns = ["service_type", "change_days"]
+    chg["count"] = df.groupby("sr_type").size().reindex(chg["service_type"]).values
+    chg = chg[chg["count"] > 500].sort_values("change_days")
+    chg["direction"] = chg["change_days"].apply(
+        lambda x: "Faster" if x < -1 else ("Slower" if x > 1 else "Stable"))
+    chg["label"] = chg["service_type"].str[:35]
+    # Show top 8 improved + top 8 worsened
+    show = pd.concat([chg.head(8), chg.tail(8)]).drop_duplicates()
+
+    shift = alt.Chart(show).mark_bar().encode(
+        x=alt.X("change_days:Q", title="Change in Median Wait (days)"),
+        y=alt.Y("label:N", sort=alt.EncodingSortField(field="change_days", order="ascending"),
+                title=""),
+        color=alt.Color("direction:N",
+                        scale=alt.Scale(
+                            domain=["Faster", "Stable", "Slower"],
+                            range=["#27ae60", "#bbb", "#c0392b"]),
+                        title="Direction"),
+        tooltip=[
+            alt.Tooltip("service_type:N", title="Service Type"),
+            alt.Tooltip("change_days:Q", title="Change (days)", format=".1f"),
+            alt.Tooltip("direction:N", title="Direction"),
+        ],
+    ).properties(height=max(380, len(show) * 26))
+
+    zero_line = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#333", strokeWidth=1).encode(
+        x="x:Q"
     )
-else:
-    st.info("No data for the selected filters. Select at least one service type.")
+    st.altair_chart(shift + zero_line, use_container_width=True)
 
-# ---------------------------------------------------------------------------
-# Section 3: Equity — Who waits the longest? (Fig 4 concentration curve)
-# ---------------------------------------------------------------------------
-st.markdown("---")
-st.header("3. Equity: Do Lower-Income Neighborhoods Wait Longer?")
-st.markdown(
-    "A core promise of municipal government is that **all residents receive "
-    "the same quality of service** regardless of where they live. The "
-    "concentration curve below tests whether slow requests (>30 days) are "
-    "spread equally across neighborhoods or concentrated in lower-income areas."
-)
 
-# Equity gap metric
-q1 = filtered[filtered["income_quintile"] == "Q1 (Lowest)"][
-    "response_time_days"
-].median()
-q5 = filtered[filtered["income_quintile"] == "Q5 (Highest)"][
-    "response_time_days"
-].median()
-if pd.notna(q1) and pd.notna(q5):
-    gap = q1 - q5
-    st.markdown("#### The Equity Gap at a Glance")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Q1 (Lowest Income)", f"{q1:.1f} days")
-    c2.metric("Q5 (Highest Income)", f"{q5:.1f} days")
-    c3.metric(
-        "Gap (Q1 - Q5)", f"{gap:+.1f} days",
-        delta=f"{gap:+.1f} days", delta_color="inverse",
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 3: EQUITY & INCOME
+# ═══════════════════════════════════════════════════════════════════════════
+with tab3:
+    f_q = f[f["income_quintile"].notna()].copy()
+
+    q1_wait = f_q[f_q["income_quintile"] == "Q1 (Lowest)"]["response_time_days"].median()
+    q5_wait = f_q[f_q["income_quintile"] == "Q5 (Highest)"]["response_time_days"].median()
+    if pd.notna(q1_wait) and pd.notna(q5_wait):
+        gap = q1_wait - q5_wait
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Q1 — Lowest Income", f"{q1_wait:.1f} days")
+        g2.metric("Q5 — Highest Income", f"{q5_wait:.1f} days")
+        g3.metric("Gap", f"{abs(gap):.1f} days {'longer' if gap > 0 else 'shorter'}")
+
+    # ── Median Wait by Income Quintile & Period ──
+    st.divider()
+    st.subheader("Median Wait by Income Quintile & Period")
+    eq = (f_q.groupby(["income_quintile", "period"])["response_time_days"]
+          .median().reset_index())
+    eq.columns = ["income_quintile", "period", "median_wait"]
+
+    grouped = alt.Chart(eq).mark_bar().encode(
+        x=alt.X("income_quintile:N", title="Income Quintile",
+                sort=Q_ORDER, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("median_wait:Q", title="Median Wait (days)"),
+        color=alt.Color("period:N", scale=PERIOD_SCALE, title="Period"),
+        xOffset="period:N",
+        tooltip=[
+            alt.Tooltip("income_quintile:N", title="Income Quintile"),
+            alt.Tooltip("period:N", title="Period"),
+            alt.Tooltip("median_wait:Q", title="Median Wait (days)", format=".1f"),
+        ],
+    ).properties(height=400)
+    st.altair_chart(grouped, use_container_width=True)
+
+    # ── Heatmap: Service Type x Income Quintile ──
+    st.divider()
+    st.subheader("Response Time: Service Type x Income Quintile")
+    st.markdown("Darker cells = longer wait.")
+    top10 = f_q["sr_type"].value_counts().head(10).index.tolist()
+    hd = (f_q[f_q["sr_type"].isin(top10)]
+          .groupby(["sr_type", "income_quintile"])["response_time_days"]
+          .median().reset_index())
+    hd.columns = ["service_type", "income_quintile", "median_wait"]
+    hd["service_label"] = hd["service_type"].str[:30]
+
+    if not hd.empty:
+        heat = alt.Chart(hd).mark_rect().encode(
+            x=alt.X("income_quintile:N", title="Income Quintile", sort=Q_ORDER),
+            y=alt.Y("service_label:N", title="Service Type",
+                    sort=alt.EncodingSortField(field="median_wait", op="mean", order="descending")),
+            color=alt.Color("median_wait:Q",
+                            scale=alt.Scale(scheme="orangered"),
+                            title="Median Wait (days)"),
+            tooltip=[
+                alt.Tooltip("service_type:N", title="Service Type"),
+                alt.Tooltip("income_quintile:N", title="Income Quintile"),
+                alt.Tooltip("median_wait:Q", title="Median Wait (days)", format=".1f"),
+            ],
+        ).properties(height=max(340, len(top10) * 36), width=600)
+
+        text = alt.Chart(hd).mark_text(fontSize=11, color="white").encode(
+            x=alt.X("income_quintile:N", sort=Q_ORDER),
+            y=alt.Y("service_label:N",
+                    sort=alt.EncodingSortField(field="median_wait", op="mean", order="descending")),
+            text=alt.Text("median_wait:Q", format=".0f"),
+        )
+        st.altair_chart(heat + text, use_container_width=True)
+
+    # ── Request Volume by Income Quintile ──
+    st.divider()
+    st.subheader("Request Volume by Income Quintile")
+    vol_q = (f_q.groupby("income_quintile").size()
+             .reset_index(name="requests"))
+
+    vol_bar = alt.Chart(vol_q).mark_bar().encode(
+        x=alt.X("income_quintile:N", title="Income Quintile",
+                sort=Q_ORDER, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("requests:Q", title="Number of Requests"),
+        color=alt.Color("income_quintile:N", scale=Q_SCALE, title="Income Quintile",
+                        legend=None),
+        tooltip=[
+            alt.Tooltip("income_quintile:N", title="Income Quintile"),
+            alt.Tooltip("requests:Q", title="Requests", format=","),
+        ],
+    ).properties(height=350)
+    st.altair_chart(vol_bar, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 4: GEOGRAPHY (map kept in Plotly — Altair lacks mapbox support)
+# ═══════════════════════════════════════════════════════════════════════════
+with tab4:
+    if geojson is None:
+        st.warning("GeoJSON not found.")
+    else:
+        import plotly.express as px
+
+        metric = st.radio(
+            "Map layer",
+            ["Requests per 1K Residents", "Median Wait (days)",
+             "Total Requests", "Poverty Rate (%)", "Median Income ($)"],
+            horizontal=True,
+        )
+
+        cs = (f.groupby("community_area")
+              .agg(total=("sr_number", "size"),
+                   median_wait=("response_time_days", "median"))
+              .reset_index())
+        cs = cs.merge(
+            ca_stats[["area_numbe", "community", "population", "median_income",
+                       "income_quintile", "poverty_rate"]],
+            left_on="community_area", right_on="area_numbe", how="left")
+        cs["per_1k"] = (cs["total"] / cs["population"] * 1000).round(1)
+        cs["poverty_pct"] = (cs["poverty_rate"] * 100).round(1)
+
+        col_map = {
+            "Total Requests": "total",
+            "Median Wait (days)": "median_wait",
+            "Requests per 1K Residents": "per_1k",
+            "Median Income ($)": "median_income",
+            "Poverty Rate (%)": "poverty_pct",
+        }
+        scale_map = {
+            "total": "YlOrRd", "median_wait": "OrRd", "per_1k": "YlOrBr",
+            "median_income": "Greens", "poverty_pct": "Reds",
+        }
+        mc = col_map[metric]
+
+        # Only show the selected metric in hover
+        hover_data_map = {
+            "community_area": False,
+            "area_numbe": False,
+            "total": False,
+            "median_wait": False,
+            "per_1k": False,
+            "median_income": False,
+            "poverty_pct": False,
+            "income_quintile": False,
+            "population": False,
+            "poverty_rate": False,
+        }
+        # Enable only the selected metric
+        fmt_map = {
+            "total": ":,",
+            "median_wait": ":.1f",
+            "per_1k": ":.1f",
+            "median_income": ":$,.0f",
+            "poverty_pct": ":.1f",
+        }
+        hover_data_map[mc] = fmt_map[mc]
+
+        label_map = {
+            "total": "Requests",
+            "median_wait": "Median Wait (days)",
+            "per_1k": "Per 1K Residents",
+            "median_income": "Median Income",
+            "poverty_pct": "Poverty Rate (%)",
+            "income_quintile": "Income Quintile",
+            "community_area": "Area",
+            "area_numbe": "Area",
+            "population": "Population",
+            "poverty_rate": "Poverty Rate",
+        }
+
+        fig = px.choropleth_mapbox(
+            cs, geojson=geojson, locations="community_area",
+            featureidkey="properties.area_numbe", color=mc,
+            color_continuous_scale=scale_map[mc],
+            mapbox_style="carto-positron",
+            center={"lat": 41.8781, "lon": -87.6298}, zoom=9.8, opacity=0.75,
+            hover_name="community",
+            hover_data=hover_data_map,
+            labels=label_map,
+        )
+        fig.update_layout(
+            template="plotly_white",
+            height=580,
+            font=dict(size=13, color="#222"),
+            showlegend=False,
+            margin=dict(l=0, r=0, t=10, b=0),
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Top / Bottom
+        st.divider()
+        t1, t2 = st.columns(2)
+        srt = cs.dropna(subset=[mc]).sort_values(mc, ascending=False)
+        cols_show = ["community", mc, "income_quintile"]
+        labels_show = ["Neighborhood", metric, "Income Quintile"]
+        with t1:
+            st.markdown("**Highest**")
+            top = srt.head(5)[cols_show].copy()
+            top.columns = labels_show
+            st.dataframe(top.reset_index(drop=True), use_container_width=True, hide_index=True)
+        with t2:
+            st.markdown("**Lowest**")
+            bot = srt.tail(5)[cols_show].copy()
+            bot.columns = labels_show
+            st.dataframe(bot.reset_index(drop=True), use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 5: NEIGHBORHOODS
+# ═══════════════════════════════════════════════════════════════════════════
+with tab5:
+    st.subheader("Top 20 Neighborhoods by Volume")
+    ns = (f.groupby(["community", "income_quintile"])
+          .agg(total=("sr_number", "size"),
+               med_wait=("response_time_days", "median"),
+               pct30=("response_time_days", lambda x: (x > 30).mean() * 100))
+          .reset_index().sort_values("total", ascending=False).head(20))
+    ns.columns = ["Neighborhood", "Income Quintile", "Requests",
+                   "Median Wait (days)", "% Over 30 Days"]
+    ns["Median Wait (days)"] = ns["Median Wait (days)"].round(1)
+    ns["% Over 30 Days"] = ns["% Over 30 Days"].round(1)
+    st.dataframe(
+        ns.reset_index(drop=True), use_container_width=True, height=480,
+        column_config={
+            "Requests": st.column_config.NumberColumn(format="%d"),
+            "Median Wait (days)": st.column_config.NumberColumn(format="%.1f"),
+            "% Over 30 Days": st.column_config.ProgressColumn(
+                min_value=0, max_value=100, format="%.1f%%"),
+        },
     )
-    if gap > 0:
-        st.markdown(
-            f"Residents in the **lowest-income** quintile wait **{gap:.1f} more days** "
-            f"on average than those in the highest-income quintile for the same types "
-            f"of city services."
-        )
 
-# Concentration curve (Fig 4 / concentration_curve)
-if ca_stats is not None:
-    conc_records = []
-    for period in ["Pre-Johnson", "Johnson Admin"]:
-        period_df = filtered[filtered["period"] == period]
-        slow = (
-            period_df[period_df["response_time_days"] > 30]
-            .groupby("community_area").size().reset_index(name="slow_count")
-        )
-        merged = ca_stats.merge(
-            slow, left_on="area_numbe", right_on="community_area", how="left"
-        )
-        merged["slow_count"] = merged["slow_count"].fillna(0)
-        merged = merged[merged["median_income"] > 0]
-        merged = merged.sort_values("median_income").reset_index(drop=True)
-        total_slow = merged["slow_count"].sum()
-        if total_slow > 0:
-            merged["cum_areas"] = np.arange(1, len(merged) + 1) / len(merged)
-            merged["cum_slow"] = merged["slow_count"].cumsum() / total_slow
-            for _, row in merged.iterrows():
-                conc_records.append({
-                    "period": period,
-                    "cum_areas": row["cum_areas"],
-                    "cum_slow": row["cum_slow"],
-                })
+    # Neighborhood drill-down
+    st.divider()
+    st.subheader("Neighborhood Deep Dive")
+    communities = sorted(f["community"].dropna().unique())
+    if len(communities) > 0:
+        pick = st.selectbox("Select neighborhood", communities)
+        nbr = f[f["community"] == pick]
 
-    if conc_records:
-        conc_df = pd.concat([
-            pd.DataFrame([
-                {"period": "Pre-Johnson", "cum_areas": 0, "cum_slow": 0},
-                {"period": "Johnson Admin", "cum_areas": 0, "cum_slow": 0},
-            ]),
-            pd.DataFrame(conc_records),
-        ], ignore_index=True)
+        n1, n2, n3 = st.columns(3)
+        n1.metric("Requests", f"{len(nbr):,}")
+        n2.metric("Median Wait", f"{nbr['response_time_days'].median():.1f} days")
+        n3.metric("Completed", f"{(nbr['status'] == 'Completed').mean() * 100:.1f}%")
 
-        conc_chart = (
-            alt.Chart(conc_df).mark_line(strokeWidth=2.5)
-            .encode(
-                x=alt.X("cum_areas:Q",
-                         title="Cumulative Share of Areas (poorest first)"),
-                y=alt.Y("cum_slow:Q",
-                         title="Cumulative Share of Slow Requests (>30 days)"),
-                color=alt.Color("period:N", title="Period",
-                                scale=alt.Scale(
-                                    domain=["Pre-Johnson", "Johnson Admin"],
-                                    range=["#1f77b4", "#ff7f0e"])),
-            ).properties(width="container", height=400)
-        )
-        eq_ref = (
-            alt.Chart(pd.DataFrame({"x": [0, 1], "y": [0, 1]}))
-            .mark_line(strokeDash=[4, 4], color="grey")
-            .encode(x="x:Q", y="y:Q")
-        )
-        st.altair_chart(conc_chart + eq_ref, use_container_width=True)
-        st.caption(
-            "If delays were spread equally, the curve would follow the diagonal. "
-            "A curve above the diagonal means poorer areas bear more delays."
-        )
+        nc1, nc2 = st.columns(2)
+        with nc1:
+            st.markdown(f"**Top services in {pick}**")
+            svc_n = (nbr.groupby("sr_type").size()
+                     .reset_index(name="requests")
+                     .nlargest(8, "requests"))
+            svc_n["service"] = svc_n["sr_type"].str[:30]
+            svc_chart = alt.Chart(svc_n).mark_bar(color=ORANGE).encode(
+                x=alt.X("requests:Q", title="Requests"),
+                y=alt.Y("service:N", sort="-x", title=""),
+                tooltip=[
+                    alt.Tooltip("sr_type:N", title="Service Type"),
+                    alt.Tooltip("requests:Q", title="Requests", format=","),
+                ],
+            ).properties(height=320)
+            st.altair_chart(svc_chart, use_container_width=True)
 
-# ---------------------------------------------------------------------------
-# Closing
-# ---------------------------------------------------------------------------
-st.markdown("---")
-st.markdown(
-    "### What This Means"
-)
-st.markdown(
-    "The patterns above are **descriptive, not causal** --- we cannot attribute "
-    "changes to any single policy or administration. But the data highlights "
-    "actionable priorities: service categories that consistently lag, "
-    "and income-based disparities that persist across administrations. "
-    "These are starting points for deeper operational review."
-)
+        with nc2:
+            st.markdown(f"**Monthly trend — {pick}**")
+            nm = (nbr.groupby(["year_month", "period"]).size()
+                  .reset_index(name="requests")
+                  .sort_values("year_month"))
+            trend_chart = alt.Chart(nm).mark_bar().encode(
+                x=alt.X("year_month:T", title="Month"),
+                y=alt.Y("requests:Q", title="Requests"),
+                color=alt.Color("period:N", scale=PERIOD_SCALE, title="Period"),
+                tooltip=[
+                    alt.Tooltip("year_month:T", title="Month", format="%b %Y"),
+                    alt.Tooltip("requests:Q", title="Requests", format=","),
+                    alt.Tooltip("period:N", title="Period"),
+                ],
+            ).properties(height=320)
+            st.altair_chart(trend_chart, use_container_width=True)
 
-# ---------------------------------------------------------------------------
-# Footer
-# ---------------------------------------------------------------------------
+
+# ── Footer ────────────────────────────────────────────────────────────────
 st.divider()
 st.caption(
-    "Data: Chicago 311 Service Requests (City of Chicago Data Portal) | "
-    "American Community Survey (U.S. Census Bureau) | "
-    "PPHA 30538 Final Project --- Iraj Butt, Fatima Hussain, Faizan Rashid"
+    "**Data:** Chicago 311 Service Requests · American Community Survey · "
+    "Community Area Boundaries — "
+    "**PPHA 30538** — Iraj Butt, Fatima Hussain, Faizan Rashid"
 )
