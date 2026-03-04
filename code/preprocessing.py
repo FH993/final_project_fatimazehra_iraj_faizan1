@@ -31,33 +31,65 @@ STUDY_START = "2021-01-01"
 STUDY_END = "2024-12-31"
 
 # URLs
-URL_311_BULK = (
-    "https://data.cityofchicago.org/api/views/v6vf-nfxy/rows.csv"
-    "?accessType=DOWNLOAD"
-)
+# Socrata SODA API endpoint — supports $limit/$offset pagination
+URL_311_API = "https://data.cityofchicago.org/resource/v6vf-nfxy.csv"
 URL_COMMUNITY_AREAS = "https://data.cityofchicago.org/resource/igwz-8jzy.geojson"
 URL_CENSUS_TRACTS = "https://data.cityofchicago.org/resource/74p9-q2aq.geojson"
 URL_ACS = "https://api.census.gov/data/2022/acs/acs5"
 
-# Download 311 Service Requests
+
+# Download 311 Service Requests (paginated to bypass Socrata's default row limit)
+def _get_with_retry(url, params=None, max_attempts=6, timeout=120):
+    """GET request with exponential backoff retry on network errors."""
+    for attempt in range(max_attempts):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except Exception as exc:
+            if attempt == max_attempts - 1:
+                raise
+            wait = 2 ** attempt          # 1, 2, 4, 8, 16, 32 s
+            print(f"\n  [retry {attempt+1}/{max_attempts-1}] {exc} — waiting {wait}s...")
+            time.sleep(wait)
+
+
 def download_311(output_path):
     if os.path.exists(output_path):
         print(f"Already exists: {output_path}")
         return
 
-    print("Downloading 311 bulk CSV...")
-    with requests.get(URL_311_BULK, stream=True, timeout=600) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        downloaded = 0
-        with open(output_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=10 * 1024 * 1024):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    pct = downloaded / total * 100
-                    print(f"    {downloaded / 1e6:.0f} MB / {total / 1e6:.0f} MB ({pct:.0f}%)", end="\r")
-    print(f"\nSaved: {output_path} ({os.path.getsize(output_path) / 1e6:.0f} MB)")
+    PAGE_SIZE = 50_000
+    all_chunks = []
+    offset = 0
+    print("Downloading 311 data via Socrata API (paginated)...")
+
+    while True:
+        params = {
+            "$limit":  PAGE_SIZE,
+            "$offset": offset,
+            "$where":  f"created_date >= '{STUDY_START}' AND created_date <= '{STUDY_END}'",
+            "$order":  "created_date ASC",
+        }
+        r = _get_with_retry(URL_311_API, params=params, timeout=120)
+
+        chunk = pd.read_csv(pd.io.common.StringIO(r.text), low_memory=False)
+        if chunk.empty:
+            break
+
+        all_chunks.append(chunk)
+        offset += len(chunk)
+        print(f"  Downloaded {offset:,} rows so far...", end="\r")
+
+        if len(chunk) < PAGE_SIZE:
+            break   # last page
+
+        time.sleep(0.25)   # be polite to the API
+
+    df_all = pd.concat(all_chunks, ignore_index=True)
+    df_all.to_csv(output_path, index=False)
+    print(f"\nSaved: {output_path} ({len(df_all):,} rows, "
+          f"{os.path.getsize(output_path) / 1e6:.0f} MB)")
 
 
 # Download ACS Census Tract Data
@@ -277,7 +309,7 @@ def main():
     print("Preprocessing Pipeline — Chicago 311 Service Delivery")
 
     # --- Download raw data ---
-    print("\nDownloading 311 Service Requests")
+    print("\nDownloading 311 Service Requests (paginated)")
     raw_311_path = os.path.join(RAW_DIR, "311_service_requests.csv")
     download_311(raw_311_path)
 
