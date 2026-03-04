@@ -1,0 +1,559 @@
+---
+title: "Generate All Figures"
+format: html
+execute:
+  echo: true
+  warning: false
+---
+
+```{python}
+#| label: setup
+import pandas as pd
+import numpy as np
+import altair as alt
+import geopandas as gpd
+import json
+import os
+
+alt.data_transformers.disable_max_rows()
+
+DERIVED_DIR = os.path.join("..", "data", "derived-data")
+FIG_DIR = os.path.join("..", "figures")
+os.makedirs(FIG_DIR, exist_ok=True)
+
+JOHNSON_INAUGURATION = pd.Timestamp("2023-05-15")
+
+# loading data
+df = pd.read_csv(
+    os.path.join(DERIVED_DIR, "311_cleaned.csv"),
+    low_memory=False,
+    parse_dates=["created_date", "closed_date"],
+)
+ca_stats = pd.read_csv(os.path.join(DERIVED_DIR, "community_area_stats.csv"))
+gdf = gpd.read_file(os.path.join(DERIVED_DIR, "community_areas.geojson"))
+
+df["year_month"] = df["created_date"].dt.to_period("M").dt.to_timestamp()
+df["period"] = np.where(
+    df["created_date"] < JOHNSON_INAUGURATION, "Pre-Johnson", "Johnson Admin"
+)
+
+# normalise keys -- figure error
+df["community_area"] = (
+    pd.to_numeric(df["community_area"], errors="coerce")
+    .astype("Int64").astype(str)
+)
+gdf["area_numbe"] = gdf["area_numbe"].astype(str)
+ca_stats["area_numbe"] = ca_stats["area_numbe"].astype(str)
+
+# Reproject to EPSG:3435
+gdf = gdf.to_crs(epsg=3435)
+
+# Top service types
+top5 = df["sr_type"].value_counts().nlargest(5).index.tolist()
+top8 = df["sr_type"].value_counts().nlargest(8).index.tolist()
+
+# Total population
+total_pop = ca_stats["population"].sum()
+
+# Inauguration helper
+rule_df = pd.DataFrame({"date": [JOHNSON_INAUGURATION]})
+
+def inaug_rule():
+    return (
+        alt.Chart(rule_df)
+        .mark_rule(color="black", strokeDash=[4, 4], strokeWidth=2)
+        .encode(x="date:T")
+    )
+
+def inaug_text():
+    return (
+        alt.Chart(rule_df)
+        .mark_text(align="left", dx=5, dy=-10, fontSize=11, fontWeight="bold")
+        .encode(x="date:T", text=alt.value("Johnson Inauguration"))
+    )
+
+print(f"Data loaded: {len(df):,} rows, {df['sr_type'].nunique()} service types")
+```
+
+## I. System-Level Performance Over Time
+
+### Figure 1 — Regime-Annotated Time Series
+
+```{python}
+#| label: fig01
+monthly_median = (
+    df[df["sr_type"].isin(top5)]
+    .groupby(["year_month", "sr_type"])["response_time_days"]
+    .agg(["median", lambda x: x.quantile(0.25), lambda x: x.quantile(0.75)])
+    .reset_index()
+)
+monthly_median.columns = ["year_month", "sr_type", "median", "q25", "q75"]
+
+band = (
+    alt.Chart(monthly_median)
+    .mark_area(opacity=0.15)
+    .encode(
+        x=alt.X("year_month:T"),
+        y=alt.Y("q25:Q"),
+        y2="q75:Q",
+        color=alt.Color("sr_type:N", legend=None),
+    )
+)
+
+lines = (
+    alt.Chart(monthly_median)
+    .mark_line()
+    .encode(
+        x=alt.X("year_month:T", title="Month"),
+        y=alt.Y("median:Q", title="Median Response Time (days)"),
+        color=alt.Color("sr_type:N", title="Service Type"),
+    )
+)
+
+fig01 = (band + lines + inaug_rule() + inaug_text()).properties(
+    width=700, height=400,
+    title="Fig 1: Monthly Median Response Time by Top Service Categories (with IQR)"
+)
+fig01.save(os.path.join(FIG_DIR, "fig01_regime_time_series.png"), scale_factor=2)
+fig01
+```
+
+### Figure 2 — Request Volume Over Time
+
+```{python}
+#| label: fig02
+monthly_vol = df.groupby("year_month").size().reset_index(name="count")
+monthly_vol["per_1k"] = monthly_vol["count"] / total_pop * 1000
+
+vol_line = (
+    alt.Chart(monthly_vol)
+    .mark_line(color="steelblue", point=True)
+    .encode(
+        x=alt.X("year_month:T", title="Month"),
+        y=alt.Y("per_1k:Q", title="Requests per 1,000 Residents"),
+        tooltip=[
+            alt.Tooltip("year_month:T", title="Month", format="%Y-%m"),
+            alt.Tooltip("per_1k:Q", title="Per 1k", format=".2f"),
+            alt.Tooltip("count:Q", title="Count", format=","),
+        ],
+    )
+)
+
+fig02 = (vol_line + inaug_rule() + inaug_text()).properties(
+    width=700, height=400,
+    title="Fig 2: Monthly 311 Requests per 1,000 Residents"
+)
+fig02.save(os.path.join(FIG_DIR, "fig02_request_volume.png"), scale_factor=2)
+fig02
+```
+
+## II. Distributional Performance
+
+### Figure 3 — Quantile Shift Plot (Pre vs During)
+
+```{python}
+#| label: fig03
+quantiles = np.arange(0.10, 0.95, 0.05)
+
+pre_q = df[df["period"] == "Pre-Johnson"]["response_time_days"].dropna().quantile(quantiles).values
+post_q = df[df["period"] == "Johnson Admin"]["response_time_days"].dropna().quantile(quantiles).values
+
+qq_df = pd.DataFrame({"pre": pre_q, "post": post_q, "percentile": [f"{int(q*100)}th" for q in quantiles]})
+
+dots = (
+    alt.Chart(qq_df)
+    .mark_circle(size=80, color="#e45756")
+    .encode(
+        x=alt.X("pre:Q", title="Pre-Johnson Quantile (days)"),
+        y=alt.Y("post:Q", title="Johnson Admin Quantile (days)"),
+        tooltip=[
+            alt.Tooltip("percentile:N", title="Percentile"),
+            alt.Tooltip("pre:Q", title="Pre (days)", format=".1f"),
+            alt.Tooltip("post:Q", title="Post (days)", format=".1f"),
+        ],
+    )
+)
+
+max_val = max(qq_df["pre"].max(), qq_df["post"].max())
+ref = (
+    alt.Chart(pd.DataFrame({"x": [0, max_val], "y": [0, max_val]}))
+    .mark_line(strokeDash=[4, 4], color="grey")
+    .encode(x="x:Q", y="y:Q")
+)
+
+fig03 = (ref + dots).properties(
+    width=500, height=500,
+    title="Fig 3: Quantile Shift — Pre vs Johnson Admin Response Times"
+)
+fig03.save(os.path.join(FIG_DIR, "fig03_quantile_shift.png"), scale_factor=2)
+fig03
+```
+
+### Figure 4 — Response-Time Survival Curves
+
+```{python}
+#| label: fig04
+days_range = np.arange(0, 91)
+surv_records = []
+for period in ["Pre-Johnson", "Johnson Admin"]:
+    subset = df[df["period"] == period]["response_time_days"].dropna()
+    n = len(subset)
+    for d in days_range:
+        surv_records.append({"days": int(d), "survival": (subset > d).sum() / n, "period": period})
+
+surv_df = pd.DataFrame(surv_records)
+
+surv_lines = (
+    alt.Chart(surv_df)
+    .mark_line()
+    .encode(
+        x=alt.X("days:Q", title="Days Since Request Created"),
+        y=alt.Y("survival:Q", title="P(Request Still Open)", scale=alt.Scale(domain=[0, 1])),
+        color=alt.Color("period:N", title="Period",
+                        scale=alt.Scale(domain=["Pre-Johnson", "Johnson Admin"],
+                                        range=["#1f77b4", "#ff7f0e"])),
+    )
+)
+
+sla_df = pd.DataFrame({"days": [7, 14, 30], "label": ["7-day", "14-day", "30-day"]})
+sla_rules = alt.Chart(sla_df).mark_rule(color="red", strokeDash=[4, 4], opacity=0.5).encode(x="days:Q")
+sla_text = alt.Chart(sla_df).mark_text(align="left", dx=3, dy=-8, fontSize=9, color="red").encode(x="days:Q", text="label:N")
+
+fig04 = (surv_lines + sla_rules + sla_text).properties(
+    width=700, height=400,
+    title="Fig 4: Response-Time Survival Curves (Pre vs Johnson Admin)"
+)
+fig04.save(os.path.join(FIG_DIR, "fig04_survival_curves.png"), scale_factor=2)
+fig04
+```
+
+## III. Equity & Inequality Over Time
+
+### Figure 5 — Dynamic Equity Gap Over Time
+
+```{python}
+#| label: fig05
+monthly_eq = (
+    df.groupby(["year_month", "income_quintile"])["response_time_days"]
+    .median()
+    .reset_index()
+    .sort_values(["income_quintile", "year_month"])
+)
+monthly_eq["rolling"] = (
+    monthly_eq.groupby("income_quintile")["response_time_days"]
+    .transform(lambda x: x.rolling(3, min_periods=1).mean())
+)
+
+eq_lines = (
+    alt.Chart(monthly_eq)
+    .mark_line()
+    .encode(
+        x=alt.X("year_month:T", title="Month"),
+        y=alt.Y("rolling:Q", title="Rolling 3-Month Median Response Time (days)"),
+        color=alt.Color("income_quintile:N", title="Income Quintile"),
+    )
+)
+
+fig05 = (eq_lines + inaug_rule() + inaug_text()).properties(
+    width=700, height=400,
+    title="Fig 5: Dynamic Equity Gap — Response Time by Income Quintile"
+)
+fig05.save(os.path.join(FIG_DIR, "fig05_equity_gap.png"), scale_factor=2)
+fig05
+```
+
+### Figure 6 — Equity Concentration Curve
+
+```{python}
+#| label: fig06
+conc_records = []
+for period in ["Pre-Johnson", "Johnson Admin"]:
+    period_df = df[df["period"] == period]
+    slow = (
+        period_df[period_df["response_time_days"] > 30]
+        .groupby("community_area").size()
+        .reset_index(name="slow_count")
+    )
+    merged = ca_stats.merge(slow, left_on="area_numbe", right_on="community_area", how="left")
+    merged["slow_count"] = merged["slow_count"].fillna(0)
+    # Drop areas with invalid income (Census API error values)
+    merged = merged[merged["median_income"] > 0]
+    merged = merged.sort_values("median_income").reset_index(drop=True)
+    merged["cum_areas"] = np.arange(1, len(merged) + 1) / len(merged)
+    merged["cum_slow"] = merged["slow_count"].cumsum() / merged["slow_count"].sum()
+    for _, row in merged.iterrows():
+        conc_records.append({"period": period, "cum_areas": row["cum_areas"], "cum_slow": row["cum_slow"]})
+
+conc_df = pd.concat([
+    pd.DataFrame([{"period": "Pre-Johnson", "cum_areas": 0.0, "cum_slow": 0.0},
+                   {"period": "Johnson Admin", "cum_areas": 0.0, "cum_slow": 0.0}]),
+    pd.DataFrame(conc_records)
+], ignore_index=True)
+
+conc_lines = (
+    alt.Chart(conc_df)
+    .mark_line()
+    .encode(
+        x=alt.X("cum_areas:Q", title="Cumulative Share of Community Areas (poorest first)"),
+        y=alt.Y("cum_slow:Q", title="Cumulative Share of Slow Requests (>30 days)"),
+        color=alt.Color("period:N", title="Period",
+                        scale=alt.Scale(domain=["Pre-Johnson", "Johnson Admin"],
+                                        range=["#1f77b4", "#ff7f0e"])),
+    )
+)
+eq_line = (
+    alt.Chart(pd.DataFrame({"x": [0, 1], "y": [0, 1]}))
+    .mark_line(color="grey", strokeDash=[4, 4], opacity=0.7)
+    .encode(x="x:Q", y="y:Q")
+)
+
+fig06 = (conc_lines + eq_line).properties(
+    width=550, height=500,
+    title="Fig 6: Equity Concentration Curve — Slow Responses by Income"
+)
+fig06.save(os.path.join(FIG_DIR, "fig06_concentration_curve.png"), scale_factor=2)
+fig06
+```
+
+## IV. Spatial Heterogeneity
+
+### Figure 7 — Spatial Change Map (Δ Performance)
+
+```{python}
+#| label: fig07
+medians = (
+    df.groupby(["community_area", "period"])["response_time_days"]
+    .median().reset_index()
+    .pivot(index="community_area", columns="period", values="response_time_days")
+    .reset_index()
+)
+medians.columns.name = None
+medians["community_area"] = medians["community_area"].astype(str)
+medians = medians.rename(columns={"Pre-Johnson": "pre", "Johnson Admin": "post"})
+medians["change"] = medians["post"] - medians["pre"]
+
+gdf_m = gdf.merge(medians, left_on="area_numbe", right_on="community_area", how="left")
+geo_json = json.loads(gdf_m.to_json())
+geo_data = alt.Data(values=geo_json["features"])
+
+fig07 = (
+    alt.Chart(geo_data)
+    .mark_geoshape(stroke="white", strokeWidth=0.5)
+    .encode(
+        color=alt.Color("properties.change:Q",
+                        scale=alt.Scale(scheme="redblue", domainMid=0, reverse=True),
+                        title="Change (days)"),
+        tooltip=[
+            alt.Tooltip("properties.community:N", title="Community Area"),
+            alt.Tooltip("properties.change:Q", title="Change (days)", format=".1f"),
+            alt.Tooltip("properties.pre:Q", title="Pre (days)", format=".1f"),
+            alt.Tooltip("properties.post:Q", title="Post (days)", format=".1f"),
+        ],
+    )
+    .project(type="identity", reflectY=True)
+    .properties(width=500, height=600,
+                title="Fig 7: Change in Median Response Time by Community Area (Post - Pre)")
+)
+fig07.save(os.path.join(FIG_DIR, "fig07_spatial_change_map.png"), scale_factor=2)
+fig07
+```
+
+### Figure 8 — Paired Dot Plot (Before vs During)
+
+```{python}
+#| label: fig08
+dot_data = medians.dropna(subset=["pre", "post"]).copy()
+dot_data = dot_data.merge(
+    gdf[["area_numbe", "community"]].rename(columns={"area_numbe": "community_area", "community": "name"}),
+    on="community_area", how="left"
+)
+dot_data = dot_data.sort_values("change", ascending=True)
+
+dot_long = dot_data.melt(
+    id_vars=["community_area", "name", "change"],
+    value_vars=["pre", "post"],
+    var_name="period", value_name="median_days",
+)
+
+seg = (
+    alt.Chart(dot_data)
+    .mark_rule(strokeWidth=1.2, color="grey")
+    .encode(
+        y=alt.Y("name:N", sort=alt.EncodingSortField(field="change", order="ascending"), title="Community Area"),
+        x=alt.X("pre:Q", title="Median Response Time (days)"),
+        x2="post:Q",
+    )
+)
+pts = (
+    alt.Chart(dot_long)
+    .mark_circle(size=55)
+    .encode(
+        y=alt.Y("name:N", sort=alt.EncodingSortField(field="change", order="ascending")),
+        x=alt.X("median_days:Q"),
+        color=alt.Color("period:N",
+                        scale=alt.Scale(domain=["pre", "post"],
+                                        range=["#1f77b4", "#d62728"]),
+                        title="Period"),
+        tooltip=[
+            alt.Tooltip("name:N", title="Area"),
+            alt.Tooltip("period:N"),
+            alt.Tooltip("median_days:Q", title="Median (days)", format=".1f"),
+        ],
+    )
+)
+
+fig08 = (seg + pts).properties(
+    width=500, height=900,
+    title="Fig 8: Paired Dot Plot — Pre vs Post Median Response Time"
+)
+fig08.save(os.path.join(FIG_DIR, "fig08_paired_dot_plot.png"), scale_factor=2)
+fig08
+```
+
+## V. Operational Decision Tools
+
+### Figure 9 — Priority Matrix (Impact × Volume)
+
+```{python}
+#| label: fig09
+cat_m = (
+    df.groupby("sr_type")
+    .agg(total=("sr_type", "count"), med_resp=("response_time_days", "median"))
+    .reset_index()
+)
+cat_m["per_capita"] = cat_m["total"] / total_pop
+
+x_med = cat_m["per_capita"].median()
+y_med = cat_m["med_resp"].median()
+
+points = (
+    alt.Chart(cat_m)
+    .mark_circle(size=70)
+    .encode(
+        x=alt.X("per_capita:Q", title="Requests per Capita"),
+        y=alt.Y("med_resp:Q", title="Median Response Time (days)"),
+        tooltip=[
+            alt.Tooltip("sr_type:N", title="Service Type"),
+            alt.Tooltip("per_capita:Q", format=".5f"),
+            alt.Tooltip("med_resp:Q", format=".1f"),
+        ],
+    )
+)
+
+# Top labels only (top 10 by volume)
+top10_labels = cat_m.nlargest(10, "total")
+labels = (
+    alt.Chart(top10_labels)
+    .mark_text(align="left", dx=7, fontSize=9)
+    .encode(x="per_capita:Q", y="med_resp:Q", text="sr_type:N")
+)
+
+h_rule = alt.Chart(pd.DataFrame({"y": [y_med]})).mark_rule(strokeDash=[4,4], color="grey").encode(y="y:Q")
+v_rule = alt.Chart(pd.DataFrame({"x": [x_med]})).mark_rule(strokeDash=[4,4], color="grey").encode(x="x:Q")
+
+fig09 = (points + labels + h_rule + v_rule).properties(
+    width=650, height=450,
+    title="Fig 9: Priority Matrix — Service Categories by Volume vs Response Time"
+)
+fig09.save(os.path.join(FIG_DIR, "fig09_priority_matrix.png"), scale_factor=2)
+fig09
+```
+
+### Figure 10 — Stability vs Change Classification
+
+```{python}
+#| label: fig10
+area_p = medians.dropna(subset=["pre", "post"]).copy()
+threshold = area_p[["pre", "post"]].median().mean()
+
+def classify(row):
+    pre_hi = row["pre"] > threshold
+    post_hi = row["post"] > threshold
+    if pre_hi and post_hi: return "Persistently Poor"
+    if not pre_hi and post_hi: return "Newly Deteriorating"
+    if pre_hi and not post_hi: return "Improving"
+    return "Consistently Strong"
+
+area_p["classification"] = area_p.apply(classify, axis=1)
+area_p = area_p.merge(
+    gdf[["area_numbe", "community"]].rename(columns={"area_numbe": "community_area", "community": "name"}),
+    on="community_area", how="left"
+)
+
+colors = {"Persistently Poor": "#d62728", "Newly Deteriorating": "#ff7f0e",
+          "Improving": "#2ca02c", "Consistently Strong": "#1f77b4"}
+
+scatter = (
+    alt.Chart(area_p)
+    .mark_circle(size=70)
+    .encode(
+        x=alt.X("pre:Q", title="Pre-Johnson Median Response Time (days)"),
+        y=alt.Y("post:Q", title="Johnson Admin Median Response Time (days)"),
+        color=alt.Color("classification:N",
+                        scale=alt.Scale(domain=list(colors.keys()), range=list(colors.values())),
+                        title="Classification"),
+        tooltip=[
+            alt.Tooltip("name:N", title="Community Area"),
+            alt.Tooltip("classification:N"),
+            alt.Tooltip("pre:Q", format=".1f"),
+            alt.Tooltip("post:Q", format=".1f"),
+        ],
+    )
+)
+
+mv = max(area_p["pre"].max(), area_p["post"].max())
+ref45 = alt.Chart(pd.DataFrame({"x": [0, mv], "y": [0, mv]})).mark_line(strokeDash=[4,4], color="grey").encode(x="x:Q", y="y:Q")
+
+fig10 = (scatter + ref45).properties(
+    width=500, height=500,
+    title="Fig 10: Stability Classification — Neighborhoods by Pre vs Post Performance"
+)
+fig10.save(os.path.join(FIG_DIR, "fig10_stability_classification.png"), scale_factor=2)
+fig10
+```
+
+## VI. Demand Composition
+
+### Figure 11 — Service Mix Shift
+
+```{python}
+#| label: fig11
+df_top8 = df[df["sr_type"].isin(top8)].copy()
+monthly_mix = df_top8.groupby(["year_month", "sr_type"]).size().reset_index(name="count")
+monthly_total = monthly_mix.groupby("year_month")["count"].transform("sum")
+monthly_mix["share"] = monthly_mix["count"] / monthly_total * 100
+
+area = (
+    alt.Chart(monthly_mix)
+    .mark_area()
+    .encode(
+        x=alt.X("year_month:T", title="Month"),
+        y=alt.Y("share:Q", stack="zero", title="Share of Requests (%)"),
+        color=alt.Color("sr_type:N", title="Service Type", scale=alt.Scale(scheme="tableau10")),
+        tooltip=[
+            alt.Tooltip("year_month:T", title="Month", format="%Y-%m"),
+            alt.Tooltip("sr_type:N", title="Type"),
+            alt.Tooltip("share:Q", title="Share (%)", format=".1f"),
+        ],
+    )
+)
+
+fig11 = (area + inaug_rule() + inaug_text()).properties(
+    width=700, height=400,
+    title="Fig 11: Service Mix Shift — Composition of 311 Demand Over Time"
+)
+fig11.save(os.path.join(FIG_DIR, "fig11_service_mix_shift.png"), scale_factor=2)
+fig11
+```
+
+## Summary
+
+All 11 figures saved to `../figures/`.
+
+```{python}
+#| label: summary
+for f in sorted(os.listdir(FIG_DIR)):
+    if f.endswith(".png"):
+        size = os.path.getsize(os.path.join(FIG_DIR, f)) / 1024
+        print(f"  {f:45s} {size:6.0f} KB")
+```
