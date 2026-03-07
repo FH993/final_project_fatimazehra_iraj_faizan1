@@ -1,4 +1,21 @@
-data/raw-data/311_service_requests.csv
-data/derived-data/311_cleaned.csv
+# Raw data (downloaded by preprocessing.py)
 data/raw-data/
+
+# Large derived data (regenerate with preprocessing.py)
 data/derived-data/311_cleaned.csv
+
+# OS files
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Environment
+venv/
+.env
+
+# Quarto render artifacts
+_freeze/
+*_files/

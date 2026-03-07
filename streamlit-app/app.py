@@ -185,11 +185,11 @@ with tab1:
     tc = (f.groupby("sr_type").size()
           .reset_index(name="requests")
           .nlargest(10, "requests"))
-    tc["service"] = tc["sr_type"].str[:40]
 
     chart = alt.Chart(tc).mark_bar(color=BLUE).encode(
         x=alt.X("requests:Q", title="Number of Requests"),
-        y=alt.Y("service:N", sort="-x", title=""),
+        y=alt.Y("sr_type:N", sort="-x", title="",
+                axis=alt.Axis(labelLimit=400)),
         tooltip=[
             alt.Tooltip("sr_type:N", title="Service Type"),
             alt.Tooltip("requests:Q", title="Requests", format=","),
@@ -200,8 +200,8 @@ with tab1:
     # ── Service Mix Over Time ──
     st.divider()
     st.subheader("Service Request Mix Over Time")
-    top6 = f["sr_type"].value_counts().head(6).index.tolist()
-    comp = (f[f["sr_type"].isin(top6)]
+    top4 = f["sr_type"].value_counts().head(4).index.tolist()
+    comp = (f[f["sr_type"].isin(top4)]
             .groupby(["year_month", "sr_type"]).size()
             .reset_index(name="requests")
             .sort_values("year_month"))
@@ -268,14 +268,13 @@ with tab2:
     chg = chg[chg["count"] > 500].sort_values("change_days")
     chg["direction"] = chg["change_days"].apply(
         lambda x: "Faster" if x < -1 else ("Slower" if x > 1 else "Stable"))
-    chg["label"] = chg["service_type"].str[:35]
     # Show top 8 improved + top 8 worsened
     show = pd.concat([chg.head(8), chg.tail(8)]).drop_duplicates()
 
     shift = alt.Chart(show).mark_bar().encode(
         x=alt.X("change_days:Q", title="Change in Median Wait (days)"),
-        y=alt.Y("label:N", sort=alt.EncodingSortField(field="change_days", order="ascending"),
-                title=""),
+        y=alt.Y("service_type:N", sort=alt.EncodingSortField(field="change_days", order="ascending"),
+                title="", axis=alt.Axis(labelLimit=400)),
         color=alt.Color("direction:N",
                         scale=alt.Scale(
                             domain=["Faster", "Stable", "Slower"],
@@ -541,10 +540,10 @@ with tab5:
             svc_n = (nbr.groupby("sr_type").size()
                      .reset_index(name="requests")
                      .nlargest(8, "requests"))
-            svc_n["service"] = svc_n["sr_type"].str[:30]
             svc_chart = alt.Chart(svc_n).mark_bar(color=ORANGE).encode(
                 x=alt.X("requests:Q", title="Requests"),
-                y=alt.Y("service:N", sort="-x", title=""),
+                y=alt.Y("sr_type:N", sort="-x", title="",
+                        axis=alt.Axis(labelLimit=400)),
                 tooltip=[
                     alt.Tooltip("sr_type:N", title="Service Type"),
                     alt.Tooltip("requests:Q", title="Requests", format=","),
