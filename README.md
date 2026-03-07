@@ -2,12 +2,12 @@
 
 This project processes and visualizes Chicago 311 service request data (2021–2024) and American Community Survey demographics to analyze service delivery patterns around the Johnson administration transition.
 
-**Dashboard:** [from-request-to-resolution.streamlit.app](https://from-request-to-resolution.streamlit.app)
+**Dashboard:** [request2resolution.streamlit.app](https://request2resolution.streamlit.app)
 
 ##### Group Members
-- Iraj Butt — iraj
-- Fatima Hussain — fatimazehra
-- Faizan Rashid — faizan1
+- Iraj Butt — irajBuchicago
+- Fatima Hussain — fh993
+- Faizan Rashid — faizan14187
 
 ## Setup
 
